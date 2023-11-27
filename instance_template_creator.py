@@ -1,7 +1,7 @@
-
+from pathlib import Path
 from enum import Enum
 from dataclasses import dataclass
-from utils import get_logger
+from utils import get_logger,wait_for_extended_operation
 from google.cloud import compute_v1
 class VMType(Enum):
     STANDARD = "STANDARD"
@@ -14,7 +14,7 @@ class BootDiskConfig:
     project_id : str
     name : str
     size_gb : int 
-    labels : dict[str=Nonestr]
+    labels : dict[str,str]
 
 @dataclass
 class VMConfig:
@@ -72,7 +72,20 @@ class InstanceTemplateCreator:
         self.logger.info("Started creating instance template ...")
         self.logger.info(f"{self.vm_metadata_confg=}")
 
-        self.create_book_disk()
+        self._create_book_disk()
+        self._attach_disks()
+        self._create_network_inteface()
+        self._create_machine_configuration()
+        self._attach_metadata()
+
+        self.logger.info("Creating Instance tempalte ...")
+        template_client = compute_v1.InstanceTemplatesClient()
+        operation = template_client.insert(project=self.project_id,instance_template_resource = self.template)
+
+        wait_for_extended_operation(operation, "instance tempalte creation")
+
+        self.logger.info("instnace template has been created")
+        return template_client.get(project=self.project_id, instance_template= self.template_name)
 
     def _create_book_disk(self) :
         boot_disk = compute_v1.AttachedDisk()
@@ -106,4 +119,47 @@ class InstanceTemplateCreator:
 
 
 
+    def _create_network_inteface(self):
+        network_interface = compute_v1.NetowrkInterface()
+        network_interface.name = "nic0" # default value
+        network_interface.network = self.network
+        network_interface.subnetwork  = self.subnetwork
+        self.template.properties.network_interfaces = [network_interface]
+
+    def create_machine_configuration(self):
+        self.template.properties.machine_type = self.vm_config.machine_type
+        if self.vm_confg.acceleratio_count > 0:
+            self.ctempalte.properties.guest_accelerators = [
+                compute_v1.AccleratorConfig(
+                    accelerator_type = self.vm_confg.accelerator_type,
+                    accelerator_count = self.vm_config.accelerator_count
+                )
+            ]
+
+        self.template.properties.service_accounts = [compute_v1.ServiceAccount(email = "default",scopes=self.scopes)]
+
+        self.tempalte.properties.labels = self.labels
+
+        vm_type = self.vm_config.vm_type
+        if vm_type == VMType.PREEMPTIBBLE:
+            self.logger.info("Using PREEMPTIBLE machine")
+            self.tempalte.properties.scheduling = compute_v1.Scheduling(preemptible=True)
+        elif vm_type == VMType.SPOT:
+            self.logger.info("Using SPOT machine")
+            self.tempalte.properties.scheduling = compute_v1.Scheduling(provisioning_model = compute_v1.Scheduling.ProvisioningModel.SPOT.name, on_host_maintenance=compute_v1.Scheduling.OnHostMaintenance.TERMINATE.name)
+        elif vm_type == VMType.STANDARD:
+            self.logger.info("Using SPOT machine")
+            self.tempalte.properties.scheduling = compute_v1.Scheduling(provisioning_model = compute_v1.Scheduling.ProvisioningModel.STANDARD.name, on_host_maintenance=compute_v1.Scheduling.OnHostMaintenance.TERMINATE.name)
+        else:
+            raise RuntimeError(f"Unsupported {vm_type=}")
+        
+    def _attach_metadata(self):
+        startup_script = self._read_startup_cript(self.startup_script_path)
+        self.template.properties.metadata.items.append(compute_v1.Items(key="startup-script",value=startup_script))
+
+        for meta_data_name, meta_data_value in self.vm_metadata_config.items():
+            self.template.properties.metadata.items.append(compute_v1.Items(key=meta_data_name, value = meta_data_value))
+
+    def _read_startup_script(self,startup_script_path:str):
+        return Path(startup_script_path).read_text()
 
